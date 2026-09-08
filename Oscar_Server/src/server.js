@@ -192,6 +192,9 @@ app.use(helmet({
 
 // ── Security: CORS — restrict to allowed origins in production ───────────────
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean);
+if (ALLOWED_ORIGINS.length === 0 && process.env.NODE_ENV === 'production') {
+  log.warn('ALLOWED_ORIGINS is not set in production — CORS is wide open (any origin accepted).');
+}
 app.use(cors({
   origin: ALLOWED_ORIGINS.length > 0
     ? (origin, cb) => (!origin || ALLOWED_ORIGINS.includes(origin)) ? cb(null, true) : cb(new Error('CORS blocked'))
@@ -569,8 +572,28 @@ app.get('/health', (req, res) => {
 const PUBLIC_DIR = path.resolve(__dirname, '../public');
 app.use(express.static(PUBLIC_DIR));
 
+// ── SPA shell rate limiter (CodeQL js/missing-rate-limiting) ─────────────────
+// The fallback below stats and streams index.html from disk, so CodeQL sees
+// filesystem access on an unauthenticated route and flags it — same rule,
+// same remedy as `fileDownloadLimiter` above. It needs its OWN bucket rather
+// than reusing that one: this is the entry point every browser navigation
+// lands on, unauthenticated and shared by every tenant, so it must not draw
+// down the same budget as report downloads. The cap is deliberately very
+// generous (1200/min/IP = 20 page loads a second) because whole vendor teams
+// reach OSCAR from one NATed office IP; it exists to bound a scripted flood,
+// not to shape normal use. Only the HTML shell passes through here — static
+// assets are served by express.static above and never reach this handler.
+const spaShellLimiter = require('express-rate-limit')({
+  windowMs: 60 * 1000,
+  max: 1200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { status: 429, title: 'Too Many Requests',
+             detail: 'Too many page loads in a short window. Slow down or wait a minute.' }
+});
+
 // SPA fallback — any unmatched GET returns index.html
-app.get('*', (req, res) => {
+app.get('/{*splat}', spaShellLimiter, (req, res) => {
   const indexPath = path.join(PUBLIC_DIR, 'index.html');
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);

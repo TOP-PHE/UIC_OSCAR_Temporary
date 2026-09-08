@@ -40,6 +40,7 @@ turns that off); an OSCAR **administrator** manages tenants, not test content.
   They version independently (see §4) but are released as tested-together
   pairs recorded in `compatibility.json`.
 - **Stack:** Node 22+, built-in `node:sqlite` (no native compile step),
+  **Express 5** (since 2026-09-05, #492 — see the migration bullet below),
   `@usebruno/cli` as the actual HTTP-execution engine (spawned as a child
   process by `worker/runner.js`). Vanilla JS + template-literal HTML on the
   frontend — no framework, event delegation keyed on `data-action`.
@@ -125,6 +126,17 @@ turns that off); an OSCAR **administrator** manages tenants, not test content.
   `main`'s gate red was cleared — it's live, required, and green now).
   Dependabot-triggered runs skip steps needing secrets (GitHub withholds
   secrets from bot PRs) but still report the job green.
+- **An exact-version `overrides` entry is a ceiling, and will silently block
+  Dependabot** (2026-09-05, #492 follow-up). `Oscar_Server/package.json`
+  pinned `overrides: { "js-yaml": "4.2.0" }`; overrides outrank every
+  dependency's own range, so two high-severity js-yaml advisories (#7 merge-key
+  quadratic CPU, #18 `!!omap` quadratic CPU — patched in 4.3.0/4.3.1) could
+  not be cleared no matter what Dependabot opened. Now `^4.3.1`, which keeps
+  the original intent (one deduped js-yaml, floored at a patched version)
+  without re-freezing it. If an override must pin an exact version, comment
+  why, and revisit it whenever an advisory names that package. Symptom to
+  recognise: a Dependabot alert that stays open with no PR, or a PR that
+  changes nothing in the lockfile.
 - **SonarQube Cloud GitHub App is installed** (2026-07-02) — the repo was
   previously wired via the CI-token upload path only (`SONAR_TOKEN` +
   `sonarcloud-github-action`), which posts a plain pass/fail check but no PR
@@ -169,6 +181,80 @@ turns that off); an OSCAR **administrator** manages tenants, not test content.
     separately from the check-run status, if branch protection has "all
     conversations must be resolved" — an unused-import note is exactly the
     kind of thing that silently blocks merge behind a green checklist.
+  - **Mutation-check any test written as a regression guard** — assert it
+    actually fails against the bug it claims to catch, before trusting it.
+    Live example (#492): a `GET /` test written to catch the wrong SPA
+    wildcard passed under *both* spellings, because `express.static` is
+    mounted first and answers `/` out of `index.html` before the fallback
+    route is ever consulted. The guard looked right, ran green, and proved
+    nothing. The real discriminator was the route pattern itself
+    (`app.router.stack` → `layer.route.path` / `layer.match('/')`) — a
+    deliberate, documented coupling to an Express internal, because it is
+    the only place the difference is observable.
+- **Express 5 since 2026-09-05 (#492).** Arrived as a Dependabot bump —
+  express 4.22.2 → 5.2.1 — because express 4 pins `qs: ~6.15.1`, so qs
+  could not move to 6.16.0 without it. The whole migration was **one line**:
+  the SPA fallback in `src/server.js`. Express 5 ships path-to-regexp v8,
+  where a bare `'*'` route is a hard **parse error at require-time**
+  (`TypeError: Missing parameter name at index 1: *`) — it does not fail a
+  request, it fails `require('src/server.js')`, so `tests/unit/server.test.js`
+  died as "Test suite failed to run" with **0 failed tests**, and CI reported
+  `1343 passed` while silently never running that file's 30 tests. A suite
+  count that drops while the test count stays green is the signature.
+  - **Use `/{*splat}`, not `/*splat`.** The Express 5 migration guide's
+    headline suggestion, `/*splat`, is *not* equivalent to Express 4's
+    `'*'`: it matches every path **except** the root `/`. Only the braced
+    `/{*splat}` matches the root too. Both load without error.
+  - Nothing else needed changing — swept and verified: no other wildcard or
+    regex route paths, no `:param?` optionals, no `req.query` assignment, no
+    `req.param()`, no `res.send(<status>)`, no `res.redirect('back')`, no
+    `app.del()`, no `req.host`. All 21 `req.body` destructuring sites already
+    used `req.body || {}`, which matters because **Express 5 leaves
+    `req.body` `undefined`** (not `{}`) when there is no body or the
+    Content-Type doesn't match — verified empirically. The two unguarded
+    `req.body.<prop>` reads (`admin.js:756`, `auth.js:357`) sit behind
+    `express-validator` `validate([...])`, which 400s before the handler.
+  - Peer deps were already Express-5-ready at their existing pins:
+    express-rate-limit 8, express-validator 7, helmet 8, multer 2.3,
+    swagger-ui-express 5.
+  - **Touching the fallback line re-opened a dormant CodeQL alert.** The
+    handler's `fs.existsSync`/`res.sendFile` had always been there, but
+    CodeQL scopes to the PR's diff — editing line 573 made the whole handler
+    "changed code" and `js/missing-rate-limiting` fired high-severity. Same
+    trap as the §2 coverage-push notes: a one-line edit can inherit an alert
+    for code you didn't write. Fixed per this repo's standing convention (a
+    real limiter, never a suppression) with a dedicated `spaShellLimiter` —
+    its own bucket, not `fileDownloadLimiter`'s, because the SPA shell is the
+    unauthenticated entry point for every navigation and must not consume the
+    report-download budget.
+- **"Not implemented" is a skip, not a failure — but only on the optional,
+  read-only GETs** (#488/#489, 2026-09-03). `osdmCompliance.js`
+  `classifySystemInfoStatus()` (all 10 `01-System Infos Requests` files via
+  `handleSystemInfoStatus()`, plus `04. GET Passenger`, `11. GET Refund
+  Offer`, `12. GET Exchange Offer`) treats HTTP 501, an OSDM Problem body
+  with `OPERATION_NOT_PERMITTED`, or a bare 404 as "not implemented by this
+  provider" (INFO, passing row), and a bare 403/405/500 the same way at
+  WARNING level; 401 always fails; 406 and anything else fail unless
+  baselined as a Known Deviation. Standards basis (verified 2026-09-03
+  against osdm.io/spec/errors-problems + RFC 9110): OSDM defines no
+  endpoint-level not-implemented signal of its own — only 501/404/405 mean
+  it per HTTP; 403/500 are accepted on SBB field evidence only, which is why
+  they are WARNING-tier and the provider-facing text cites RFC 9110, never
+  "OSDM expects". The Report Builder's Vendor Capability Matrix
+  (`reports/structureResults.js` `classifyVendorCapability`) mirrors this
+  through an **exact-request-name allowlist** (`CAPABILITY_PROBE_ENDPOINTS`)
+  — never a blanket status-code rule, which would relabel NHF probes that
+  deliberately expect those codes. Mutation endpoints (POST/PATCH/DELETE)
+  keep their strict checks.
+- **Booking price members are lifecycle-scoped** (#375, #496).
+  `bookings.js` `isPostConfirmationStage()` decides which member a
+  GET-Booking step asserts: PREBOOKED/ON_HOLD → `provisionalPrice`
+  ("unconfirmed pre-booked parts"); CONFIRMED/FULFILLED/REFUNDED/EXCHANGED →
+  `confirmedPrice` ("confirmed parts minus confirmed refund amounts");
+  EXCHANGE_ONGOING deliberately stays provisional (the exchange creates new
+  pre-booked parts). The other member is optional at every stage. At
+  REFUNDED/EXCHANGED an `[INFO]` line shows confirmedPrice before/after —
+  logged, not asserted (open OTST point, see §6).
 - **Deploy:** VPS Docker image; `Bruno_Collection/` + `compatibility.json` are
   **bind-mounted, not baked into the image** — a `refresh-collection.yml`
   workflow `git pull`s the VPS on every push to `main`.
@@ -201,14 +287,13 @@ npm test           # jest (tests/unit + tests/integration)
 ```
 Node 22+ required (built-in `node:sqlite`).
 
-**Local quirk (this checkout only):** the path contains a space
-(`…/UIC_New_Revenue_Management project/…`), which breaks `npx jest`'s default
-glob resolution ("0 tests found" even though tests exist). Workaround:
-```bash
-npx jest --rootDir="$(pwd)" --testMatch="**/*.test.js"
-```
-Not a real project issue — CI runs plain `npm test` with no problem (no space
-in the runner's path).
+**Local checkout path (since 2026-08):**
+`…\TrackOnPath\Contract\UIC\projets\OSDM\OTST\UIC-OSCAR\oscar-monorepo` — no
+space in it, so plain `npm test` / `npx jest` work locally exactly as in CI.
+(The previous checkout lived under `…/UIC_New_Revenue_Management project/…`;
+the space broke `npx jest`'s default glob resolution — "0 tests found". If a
+checkout ever lands in a path with a space again, the workaround is
+`npx jest --rootDir="$(pwd)" --testMatch="**/*.test.js"`.)
 
 **Version bookkeeping — bump per functional PR:**
 - `Oscar_Server/package.json` (`version`) — server semver, bump on any
@@ -245,11 +330,16 @@ in the runner's path).
 | `sonar-project.properties` | SonarCloud scope/exclusions + the custom "OSCAR Gate" thresholds (ratcheted 35%→83% new-coverage / <4% duplication as the coverage push landed — see §2) |
 | `tests/unit/db-migrations.test.js` | runs the **real** migration path against throwaway DBs — the #208 regression-class guard |
 | `tests/unit/runner.test.js` | `worker/runner.js` coverage — `child_process.spawn` fully mocked via a `makeFakeProc()` EventEmitter + `waitForSpawnCalls()` polling helper (never a fixed sleep) |
-| `tests/unit/server.test.js` | `src/server.js` coverage — supertest against the real exported `app`; one isolated `NODE_ENV=production` re-require covers the HTTPS-redirect middleware |
+| `tests/unit/server.test.js` | `src/server.js` coverage — supertest against the real exported `app`; one isolated `NODE_ENV=production` re-require covers the HTTPS-redirect middleware; the `SPA fallback` block guards the Express 5 `/{*splat}` route pattern (#492) |
 | `tests/integration/company-places.test.js` | Places API: refresh pagination/dedupe (stubbed `fetch`), ranked `?q=` search, role gating |
 
 ## 6. Next steps
 
+- **Open OTST point (#496, 2026-09-03):** OSDM defines `confirmedPrice` as
+  net of confirmed refund amounts, but SBB INT still showed the pre-refund
+  amount after REFUNDED. OSCAR only logs before/after at INFO; turning it
+  into an assertion (or a per-company Known Deviation) waits for OTST/SBB to
+  say whether that run was a partial refund or a deviation.
 - **#447–#450 (the prior batch) are all done.** #447/#448 merged earlier;
   **#449** (Test-Manager-gated registration) and **#450** (Places API lookup)
   both shipped 2026-07-01/02 — see the §2 bullets above. Nothing left open
